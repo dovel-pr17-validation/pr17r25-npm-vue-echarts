@@ -49,7 +49,7 @@
   "devDependencies": {
     "@types/node": "^24.13.4",
     "@vercel/analytics": "^2.0.1",
-    "@vitejs/plugin-vue": "^6.0.9",
+    "@vitejs/plugin-vue": "^6.0.10",
     "@vitest/browser-playwright": "^5.0.2",
     "@vitest/coverage-istanbul": "^5.0.2",
     "@vue/runtime-core-3.3": "npm:@vue/runtime-core@3.3.0",
