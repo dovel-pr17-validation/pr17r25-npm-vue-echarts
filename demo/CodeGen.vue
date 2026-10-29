@@ -1,0 +1,628 @@
+<script setup lang="ts">
+import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from "vue";
+import { useLocalStorage, useTimeoutFn } from "@vueuse/core";
+import { track } from "@vercel/analytics";
+
+import { getImportsFromDependencies, type Quote, type PublicCodegenOptions } from "./utils/codegen";
+import {
+  createOptionEditor,
+  createCodeViewer,
+  monaco,
+  type OptionEditor,
+  type CodeViewer,
+} from "./services/monaco";
+import { useOptionAnalysis } from "./composables/useOptionAnalysis";
+import type { AnalysisIssue } from "./workers/option.types";
+import { useDemoDark } from "./composables/useDemoDark";
+
+const DEFAULT_OPTION = `{
+  title: {
+    text: 'Referer of a Website',
+    subtext: 'Fake Data',
+    left: 'center'
+  },
+  tooltip: {
+    trigger: 'item'
+  },
+  legend: {
+    orient: 'vertical',
+    left: 'left'
+  },
+  series: [
+    {
+      name: 'Access From',
+      type: 'pie',
+      radius: '50%',
+      data: [
+        { value: 1048, name: 'Search Engine' },
+        { value: 735, name: 'Direct' },
+        { value: 580, name: 'Email' },
+        { value: 484, name: 'Union Ads' },
+        { value: 300, name: 'Video Ads' }
+      ],
+      emphasis: {
+        itemStyle: {
+          shadowBlur: 10,
+          shadowOffsetX: 0,
+          shadowColor: 'rgba(0, 0, 0, 0.5)'
+        }
+      }
+    }
+  ]
+}`;
+
+interface CodegenPreferences {
+  indent: string;
+  quote: Quote;
+  multiline: boolean;
+  maxLen: number;
+  semi: boolean;
+  includeType: boolean;
+}
+
+const codegenOptions = useLocalStorage<CodegenPreferences>("ve.codegenOptions", {
+  indent: "  ",
+  quote: "'",
+  multiline: false,
+  maxLen: 80,
+  semi: false,
+  includeType: false,
+} satisfies CodegenPreferences);
+
+const props = defineProps<{
+  open: boolean;
+  renderer: string;
+  returnFocus: HTMLElement | null;
+}>();
+const emit = defineEmits<{ "update:open": [boolean] }>();
+
+const { code: sourceCode, state: analysisState } = useOptionAnalysis(DEFAULT_OPTION);
+
+const modal = ref<HTMLDialogElement | null>(null);
+const dialog = ref<HTMLElement | null>(null);
+let mouseDownTarget: Node | null = null;
+
+const editorEl = ref<HTMLElement | null>(null);
+const outputEl = ref<HTMLElement | null>(null);
+let optionEditor: OptionEditor | null = null;
+let importViewer: CodeViewer | null = null;
+let suppressNextEditorEvent = false;
+const initializing = ref(true);
+const showAnalyzingOverlay = ref(false);
+const ON_DEMAND_TIMEOUT = { immediate: false };
+const { start: scheduleAnalyzingOverlay, stop: cancelAnalyzingOverlay } = useTimeoutFn(
+  () => {
+    showAnalyzingOverlay.value = true;
+  },
+  180,
+  ON_DEMAND_TIMEOUT,
+);
+
+type Renderer = "canvas" | "svg";
+
+const renderer = ref<Renderer>(props.renderer === "svg" ? "svg" : "canvas");
+
+const isDark = useDemoDark();
+const monacoTheme = computed(() => (isDark.value ? "vs-dark" : "vs"));
+
+watch(
+  () => props.renderer,
+  (value) => {
+    if (props.open) {
+      renderer.value = value === "svg" ? "svg" : "canvas";
+    }
+  },
+);
+
+function onMousedown(event: MouseEvent) {
+  mouseDownTarget = event.target instanceof Node ? event.target : null;
+}
+
+function closeFromOutside(event: MouseEvent) {
+  const content = dialog.value;
+  const startedInside = mouseDownTarget ? Boolean(content?.contains(mouseDownTarget)) : false;
+  mouseDownTarget = null;
+  const endedInside = event.target instanceof Node && Boolean(content?.contains(event.target));
+  if (startedInside || endedInside) {
+    return;
+  }
+  close();
+}
+
+function close() {
+  emit("update:open", false);
+}
+
+function syncOpenState(open: boolean) {
+  const element = modal.value;
+  if (!element) {
+    return;
+  }
+  if (open && !element.open) {
+    element.showModal();
+  } else if (!open && element.open) {
+    element.close();
+  }
+  if (!open) {
+    return;
+  }
+  renderer.value = props.renderer === "svg" ? "svg" : "canvas";
+  optionEditor?.editor.focus();
+  optionEditor?.editor.layout();
+  importViewer?.editor.layout();
+}
+
+function onDialogClose() {
+  if (props.open) {
+    close();
+  }
+  props.returnFocus?.focus();
+}
+
+const copied = ref(false);
+const message = ref("");
+const { start: scheduleMessageClose } = useTimeoutFn(
+  () => {
+    message.value = "";
+  },
+  2018,
+  ON_DEMAND_TIMEOUT,
+);
+
+function trackCopy(from: "button" | "system") {
+  if (copied.value) {
+    return;
+  }
+  copied.value = true;
+  track("copy-code", { from });
+}
+
+function showMessage(text: string) {
+  message.value = text;
+  scheduleMessageClose();
+}
+
+function formatIssues(issues: readonly AnalysisIssue[]) {
+  return issues
+    .map((issue) => {
+      const lines = [`/* ${issue.message} */`];
+      if (issue.hint) {
+        lines.push(`// Hint: ${issue.hint}`);
+      }
+      if (issue.range) {
+        const pointer = `${issue.range.startLineNumber}:${issue.range.startColumn}`;
+        lines.push(`// ${pointer}`);
+      }
+      return lines.join("\n");
+    })
+    .join("\n\n");
+}
+
+const isBusy = computed<boolean>(() => initializing.value || showAnalyzingOverlay.value);
+
+const importCode = computed(() => {
+  const raw = sourceCode.value.trim();
+  if (!raw) {
+    return "// Paste your option code first";
+  }
+
+  if (analysisState.status === "analyzing") {
+    return "// Analyzing option…";
+  }
+
+  if (analysisState.status === "error") {
+    const blockingIssues = analysisState.issues.filter((issue) => issue.severity === "error");
+    return formatIssues(blockingIssues);
+  }
+
+  if (!analysisState.dependencies) {
+    return "// Option analysis did not produce a result";
+  }
+
+  try {
+    const preferences = codegenOptions.value;
+    const config: PublicCodegenOptions = {
+      indent: preferences.indent,
+      quote: preferences.quote,
+      multiline: preferences.multiline,
+      maxLen: preferences.maxLen,
+      semi: preferences.semi,
+      includeType: preferences.includeType,
+      renderer: renderer.value,
+    };
+    return getImportsFromDependencies(analysisState.dependencies, config);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error ?? "Unknown error");
+    return `/* Invalid ECharts option */\n\n// ${message}`;
+  }
+});
+
+watch(importCode, (value) => {
+  importViewer?.setValue(value);
+  copied.value = false;
+});
+
+async function copy() {
+  try {
+    await navigator.clipboard.writeText(importCode.value);
+  } catch {
+    showMessage("Couldn't copy to clipboard");
+    return;
+  }
+  trackCopy("button");
+  showMessage("Copied to clipboard");
+}
+
+onMounted(async () => {
+  await nextTick();
+  monaco.editor.setTheme(monacoTheme.value);
+  if (editorEl.value) {
+    optionEditor = createOptionEditor(editorEl.value, {
+      initialCode: sourceCode.value,
+      onChange(value) {
+        if (suppressNextEditorEvent) {
+          return;
+        }
+        sourceCode.value = value;
+      },
+    });
+    optionEditor.setMarkers(analysisState.diagnostics);
+  }
+  if (outputEl.value) {
+    importViewer = createCodeViewer(outputEl.value, {
+      initialCode: importCode.value,
+      language: codegenOptions.value.includeType ? "typescript" : "javascript",
+    });
+  }
+  initializing.value = false;
+  syncOpenState(props.open);
+});
+
+watch(monacoTheme, (theme) => monaco.editor.setTheme(theme));
+
+watch(
+  () => codegenOptions.value.includeType,
+  (includeType) => {
+    importViewer?.setLanguage(includeType ? "typescript" : "javascript");
+    importViewer?.setValue(importCode.value);
+  },
+);
+
+watch(
+  () => analysisState.status,
+  (status) => {
+    if (status === "analyzing") {
+      scheduleAnalyzingOverlay();
+      return;
+    }
+    cancelAnalyzingOverlay();
+    showAnalyzingOverlay.value = false;
+  },
+  { immediate: true },
+);
+
+watch(
+  () => props.open,
+  async (value) => {
+    await nextTick();
+    syncOpenState(value);
+  },
+);
+
+watch(
+  () => analysisState.diagnostics,
+  (diagnostics) => {
+    optionEditor?.setMarkers(diagnostics);
+  },
+  { deep: true },
+);
+
+watch(sourceCode, (value) => {
+  if (!optionEditor) {
+    return;
+  }
+  const current = optionEditor.getValue();
+  if (current === value) {
+    return;
+  }
+  try {
+    suppressNextEditorEvent = true;
+    optionEditor.setValue(value);
+  } finally {
+    suppressNextEditorEvent = false;
+  }
+});
+
+onBeforeUnmount(() => {
+  optionEditor?.dispose();
+  optionEditor = null;
+  importViewer?.dispose();
+  importViewer = null;
+});
+</script>
+
+<template>
+  <dialog
+    ref="modal"
+    class="modal"
+    aria-labelledby="codegen-title"
+    @mousedown="onMousedown"
+    @click="closeFromOutside"
+    @cancel.prevent="close"
+    @close="onDialogClose"
+  >
+    <section ref="dialog" class="dialog">
+      <header class="dialog-header">
+        <h2 id="codegen-title">Generate import code</h2>
+        <button class="dialog-close" type="button" aria-label="Close code generator" @click="close">
+          ×
+        </button>
+      </header>
+      <section class="options">
+        <label>
+          Renderer
+          <select v-model="renderer">
+            <option value="canvas">Canvas</option>
+            <option value="svg">SVG</option>
+          </select>
+        </label>
+        <label>
+          TypeScript
+          <input v-model="codegenOptions.includeType" type="checkbox" />
+        </label>
+        <label>
+          Multiline
+          <input v-model="codegenOptions.multiline" type="checkbox" />
+        </label>
+        <label>
+          Semi
+          <input v-model="codegenOptions.semi" type="checkbox" />
+        </label>
+        <label>
+          Quote
+          <select v-model="codegenOptions.quote">
+            <option value="'">Single</option>
+            <option value='"'>Double</option>
+          </select>
+        </label>
+        <label>
+          Indent
+          <select v-model="codegenOptions.indent">
+            <option value="  ">2 spaces</option>
+            <option value="    ">4 spaces</option>
+            <option value="	">Tab</option>
+          </select>
+        </label>
+        <label>
+          Max length
+          <input v-model.number="codegenOptions.maxLen" type="number" step="10" />
+        </label>
+      </section>
+      <section class="code">
+        <div
+          ref="editorEl"
+          class="option-code"
+          aria-label="ECharts option (TS/JS literal)"
+          :aria-busy="isBusy"
+        ></div>
+        <div
+          ref="outputEl"
+          class="import-code"
+          role="textbox"
+          aria-label="Generated import code"
+          aria-readonly="true"
+          @copy="trackCopy('system')"
+        ></div>
+        <button class="copy" :disabled="analysisState.status !== 'ready'" @click="copy">
+          Copy
+        </button>
+      </section>
+    </section>
+    <aside class="message" :class="{ open: message }" role="status" aria-live="polite">
+      {{ message }}
+    </aside>
+  </dialog>
+</template>
+
+<style>
+.modal {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  max-width: none;
+  max-height: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+
+  &[open] {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+}
+
+.modal::backdrop {
+  background-color: rgba(2, 6, 23, 0.35);
+}
+
+.dialog {
+  display: flex;
+  flex-direction: column;
+  width: 80vw;
+  height: 90vh;
+  border-radius: var(--r-l);
+  overflow: hidden;
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+.dialog-header {
+  display: grid;
+  grid-template-columns: 2.25rem minmax(0, 1fr) 2.25rem;
+  align-items: center;
+  padding: var(--space-3) var(--space-4);
+}
+
+.dialog-header h2 {
+  grid-column: 2;
+  margin: 0;
+}
+
+.dialog-close {
+  grid-column: 3;
+  width: 2.25rem;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border-color: transparent;
+  font-size: 1.25rem;
+}
+
+.dialog-close:hover {
+  color: var(--heading);
+}
+
+.options {
+  display: flex;
+  justify-content: center;
+  align-items: stretch;
+  gap: var(--space-4);
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--border);
+
+  label {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--muted);
+  }
+
+  input[type="number"] {
+    width: 54px;
+  }
+
+  input[type="checkbox"] {
+    width: 1rem;
+    height: 1rem;
+    accent-color: var(--accent);
+  }
+}
+
+.code {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  text-align: left;
+  align-items: stretch;
+  flex-grow: 1;
+  min-height: 0;
+  tab-size: 4;
+
+  .option-code,
+  .import-code {
+    flex: 0 0 50%;
+    min-width: 0;
+    margin: 0;
+    border: none;
+  }
+
+  .option-code[aria-busy="true"]::after {
+    content: "Analyzing...";
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    background: var(--surface);
+    color: var(--muted);
+    font-size: 0.85rem;
+    pointer-events: none;
+    z-index: 1;
+  }
+}
+
+.copy {
+  position: absolute;
+  right: var(--space-2);
+  top: var(--space-2);
+  border-radius: var(--r-m);
+  border: 1px solid var(--border);
+}
+
+@media (max-width: 720px) {
+  .dialog {
+    width: calc(100vw - var(--space-4));
+    height: calc(100svh - var(--space-4));
+    border-radius: var(--r-m);
+  }
+
+  .dialog-header {
+    padding: var(--space-2) var(--space-3);
+  }
+
+  .dialog-header h2 {
+    font-size: 1.25rem;
+  }
+
+  .options {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
+    max-height: 11rem;
+    padding: var(--space-3);
+    overflow-y: auto;
+  }
+
+  .code {
+    flex-direction: column;
+
+    .option-code,
+    .import-code {
+      flex: 1 1 50%;
+      width: 100%;
+      min-height: 0;
+    }
+
+    .import-code {
+      border-top: 1px solid var(--border);
+    }
+  }
+
+  .copy {
+    top: calc(50% + var(--space-2));
+  }
+}
+
+.message {
+  position: fixed;
+  z-index: 2147483647;
+  bottom: 2rem;
+  left: 50%;
+  padding: var(--space-2) var(--space-3);
+  background-color: color-mix(in srgb, var(--text) 88%, var(--surface) 12%);
+  box-shadow: var(--shadow);
+  color: var(--surface);
+  font-size: 0.875rem;
+  transform: translate(-50%, 200%);
+  border: 1px solid color-mix(in srgb, var(--text) 20%, transparent);
+  border-radius: var(--r-s);
+  opacity: 0;
+  transition:
+    transform 0.2s,
+    opacity 0.2s;
+}
+
+html.dark .message {
+  background-color: color-mix(in srgb, var(--surface) 72%, var(--border) 28%);
+  color: var(--heading);
+  border: 1px solid color-mix(in srgb, var(--border) 45%, transparent 55%);
+}
+
+.message.open {
+  transform: translate(-50%, 0);
+  opacity: 1;
+}
+</style>

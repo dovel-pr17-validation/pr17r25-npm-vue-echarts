@@ -1,0 +1,734 @@
+import { describe, expect, it, vi } from "vitest";
+import { createSSRApp, defineComponent, h, nextTick, onUnmounted, reactive, ref } from "vue";
+import { render } from "./helpers/testing";
+import { flushAnimationFrame, withConsoleWarnAsync } from "./helpers/dom";
+import { createEChartsModule } from "./helpers/mock";
+import ECharts from "../src/ECharts";
+import { registerExtension } from "../src/graphic/extension";
+import { GGroup, GRect } from "../src/graphic/components";
+import {
+  getLastGraphicIds,
+  getLastGraphicOption,
+  getLastGraphicChanges,
+  setupGraphicSlotSuite,
+} from "./helpers/graphic-slot";
+import { GRAPHIC_SSR_MARKUP } from "./helpers/ssr";
+
+vi.mock("echarts/core", () => createEChartsModule());
+
+const suite = setupGraphicSlotSuite();
+
+function getLastSetOptionCall(chartStub: {
+  setOption: { mock: { calls: unknown[][] } };
+}): [any, any] {
+  const lastCall = chartStub.setOption.mock.calls.at(-1);
+  if (!lastCall) {
+    throw new Error("Expected chart.setOption to be called at least once.");
+  }
+  return lastCall as [any, any];
+}
+
+describe("graphic slot edge and integration behavior", () => {
+  it("warns when graphic slot is used without the graphic entry", async () => {
+    const option = ref({
+      graphic: { elements: [{ type: "rect", id: "from-option", shape: { x: 0, y: 0 } }] },
+    });
+
+    const Root = defineComponent({
+      setup() {
+        return () => h(ECharts, { option: option.value }, { graphic: () => h("div") });
+      },
+    });
+
+    await withConsoleWarnAsync(async (warnSpy) => {
+      await render(Root);
+      const hasGraphicHint = warnSpy.mock.calls.some((call: unknown[]) =>
+        String(call[0]).includes("Import from `vue-echarts/graphic` to enable it."),
+      );
+      expect(hasGraphicHint).toBe(true);
+    });
+
+    await nextTick();
+    const chartStub = suite.getChartStub();
+    expect(chartStub.setOption).toHaveBeenCalledTimes(1);
+    expect(chartStub.setOption.mock.calls[0][0]).toMatchObject(option.value);
+  });
+
+  it("hydrates a server-rendered graphic slot without mismatch warnings", async () => {
+    registerExtension();
+
+    const graphic = vi.fn(() => h(GRect, { id: "server-rect", width: 20, height: 10 }));
+    const app = createSSRApp({
+      render: () => h(ECharts, { option: {} }, { graphic }),
+    });
+    const container = document.body.appendChild(document.createElement("div"));
+    container.innerHTML = GRAPHIC_SSR_MARKUP;
+
+    try {
+      await withConsoleWarnAsync(async (warnSpy) => {
+        app.mount(container);
+        await flushAnimationFrame();
+
+        expect(
+          warnSpy.mock.calls.filter((call: unknown[]) =>
+            String(call[0]).toLowerCase().includes("hydration"),
+          ),
+        ).toEqual([]);
+        expect(graphic).toHaveBeenCalledOnce();
+        expect(getLastGraphicIds(suite.getChartStub())).toContain("server-rect");
+      });
+    } finally {
+      app.unmount();
+    }
+  });
+
+  it("overrides option.graphic when the graphic entry is registered", async () => {
+    registerExtension();
+
+    const option = ref({
+      graphic: { elements: [{ type: "rect", id: "from-option", shape: { x: 0, y: 0 } }] },
+    });
+    const transform = {
+      skewX: 0.2,
+      skewY: 0.1,
+      anchorX: 5,
+      anchorY: 6,
+    };
+
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            { option: option.value },
+            {
+              graphic: () =>
+                h(GRect, {
+                  id: "slot-rect",
+                  x: 10,
+                  y: 10,
+                  width: 20,
+                  height: 12,
+                  z2: 7,
+                  ...transform,
+                }),
+            },
+          );
+      },
+    });
+
+    await withConsoleWarnAsync(async (warnSpy) => {
+      await render(Root);
+      await nextTick();
+      await flushAnimationFrame();
+
+      const [lastCall] = getLastSetOptionCall(suite.getChartStub());
+      expect(lastCall.graphic.elements[0].children[0]).toMatchObject({
+        id: "slot-rect",
+        z2: 7,
+        ...transform,
+      });
+      expect(
+        lastCall.graphic.elements[0].children.some((child: any) => child.id === "from-option"),
+      ).toBe(false);
+      expect(
+        warnSpy.mock.calls.some((call: unknown[]) => String(call[0]).includes("option.graphic")),
+      ).toBe(true);
+    });
+  });
+
+  it("resizes before the initial graphic commit with autoresize", async () => {
+    registerExtension();
+
+    const option = { series: [{ type: "line", data: [1, 2, 3] }] };
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            {
+              option,
+              autoresize: true,
+              style: { width: "120px", height: "80px" },
+            },
+            {
+              graphic: () => h(GRect, { id: "slot-rect", x: 10, y: 10, width: 20, height: 12 }),
+            },
+          );
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+
+    const chartStub = suite.getChartStub();
+    expect(chartStub.resize).toHaveBeenCalledTimes(1);
+    expect(chartStub.setOption).toHaveBeenCalledTimes(1);
+    expect(chartStub.resize.mock.invocationCallOrder[0]).toBeLessThan(
+      chartStub.setOption.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("reapplies graphic option after theme changes", async () => {
+    registerExtension();
+
+    const option = ref({
+      series: [{ type: "line", data: [1, 2, 3] }],
+    });
+    const theme = ref<any>(undefined);
+    const x = ref(10);
+
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            { option: option.value, theme: theme.value },
+            {
+              graphic: () =>
+                h(GRect, { id: "slot-rect", x: x.value, y: 10, width: 20, height: 12 }),
+            },
+          );
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+    await flushAnimationFrame();
+
+    const chartStub = suite.getChartStub();
+    chartStub.setOption.mockClear();
+
+    x.value = 32;
+    theme.value = { backgroundColor: "#111827" };
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(chartStub.setTheme).toHaveBeenCalledWith({ backgroundColor: "#111827" });
+    expect(chartStub.setOption).toHaveBeenCalledTimes(1);
+    const [optionArg, updateArg] = getLastSetOptionCall(chartStub);
+    expect(optionArg.graphic.elements[0].children[0].shape).toMatchObject({ x: 32 });
+    expect(updateArg?.notMerge || updateArg?.replaceMerge?.includes("graphic")).toBe(true);
+  });
+
+  it("skips graphic updates when only non-graphic group content changes", async () => {
+    registerExtension();
+
+    const tick = ref(0);
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            { option: {} },
+            {
+              graphic: () => h(GGroup, { id: "group" }, () => `tick-${tick.value}`),
+            },
+          );
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+    await flushAnimationFrame();
+
+    const chartStub = suite.getChartStub();
+    chartStub.setOption.mockClear();
+    tick.value++;
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(chartStub.setOption).not.toHaveBeenCalled();
+  });
+
+  it("does not auto-reapply graphic option on theme changes in manual-update mode", async () => {
+    registerExtension();
+
+    const option = ref({
+      series: [{ type: "line", data: [1, 2, 3] }],
+    });
+    const theme = ref<any>("dark");
+
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            { option: option.value, theme: theme.value, manualUpdate: true },
+            {
+              graphic: () => h(GRect, { id: "slot-rect", x: 10, y: 10, width: 20, height: 12 }),
+            },
+          );
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+    await flushAnimationFrame();
+
+    const chartStub = suite.getChartStub();
+    chartStub.setOption.mockClear();
+
+    theme.value = undefined;
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(chartStub.setTheme).toHaveBeenLastCalledWith({});
+    expect(chartStub.setOption).not.toHaveBeenCalled();
+  });
+
+  it("clears graphic when #graphic slot is turned off and restores when turned on again", async () => {
+    registerExtension();
+
+    const option = ref({ series: [{ type: "line", data: [1, 2, 3] }] });
+    const showGraphic = ref(true);
+
+    const Root = defineComponent({
+      setup() {
+        return () => {
+          const children = showGraphic.value
+            ? {
+                graphic: () => h(GRect, { id: "slot-rect", x: 10, y: 10, width: 20, height: 12 }),
+              }
+            : {};
+          return h(ECharts, { option: option.value }, children);
+        };
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+    await flushAnimationFrame();
+    const chartStub = suite.getChartStub();
+    expect(getLastGraphicIds(chartStub)).toEqual(["slot-rect"]);
+
+    chartStub.setOption.mockClear();
+    showGraphic.value = false;
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(chartStub.setOption).toHaveBeenCalledOnce();
+    const [optionArg, updateArg] = getLastSetOptionCall(chartStub);
+    expect(optionArg.graphic).toBeUndefined();
+    expect(updateArg?.replaceMerge).toContain("graphic");
+
+    chartStub.setOption.mockClear();
+    option.value = { series: [{ type: "line", data: [3, 2, 1] }] };
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(getLastSetOptionCall(chartStub)[1]).toEqual({ notMerge: false });
+
+    showGraphic.value = true;
+    await nextTick();
+    await flushAnimationFrame();
+    expect(getLastGraphicIds(chartStub)).toEqual(["slot-rect"]);
+  });
+
+  it("renders and clears #graphic without an option prop", async () => {
+    registerExtension();
+
+    const showGraphic = ref(true);
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            {},
+            showGraphic.value
+              ? {
+                  graphic: () =>
+                    h(GRect, { id: "graphic-only", x: 10, y: 10, width: 20, height: 12 }),
+                }
+              : {},
+          );
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+    await flushAnimationFrame();
+
+    const chartStub = suite.getChartStub();
+    expect(getLastGraphicIds(chartStub)).toEqual(["graphic-only"]);
+
+    chartStub.setOption.mockClear();
+    showGraphic.value = false;
+    await nextTick();
+    await flushAnimationFrame();
+
+    const [optionArg, updateArg] = getLastSetOptionCall(chartStub);
+    expect(optionArg.graphic).toBeUndefined();
+    expect(updateArg?.replaceMerge).toContain("graphic");
+
+    showGraphic.value = true;
+    await nextTick();
+    await flushAnimationFrame();
+    expect(getLastGraphicIds(chartStub)).toEqual(["graphic-only"]);
+  });
+
+  it("unmounts the graphic slot after terminal disposal", async () => {
+    registerExtension();
+
+    let dispose: (() => void) | undefined;
+    const onGraphicUnmounted = vi.fn();
+    const Graphic = defineComponent(() => {
+      onUnmounted(onGraphicUnmounted);
+      return () => h(GRect, { id: "disposed-graphic", width: 10, height: 10 });
+    });
+    const Root = defineComponent(
+      () => () =>
+        h(
+          ECharts,
+          { ref: (value) => (dispose = (value as { dispose: () => void } | null)?.dispose) },
+          { graphic: () => h(Graphic) },
+        ),
+    );
+
+    await render(Root);
+    await nextTick();
+    expect(onGraphicUnmounted).not.toHaveBeenCalled();
+
+    dispose?.();
+    await nextTick();
+
+    expect(onGraphicUnmounted).toHaveBeenCalledOnce();
+  });
+
+  it("applies dynamic empty #graphic slot presence changes", async () => {
+    registerExtension();
+
+    const option = ref({
+      graphic: {
+        elements: [{ type: "rect", id: "from-option" }],
+      },
+    });
+    const showGraphic = ref(false);
+
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            { option: option.value },
+            showGraphic.value ? { graphic: () => undefined } : {},
+          );
+      },
+    });
+
+    await withConsoleWarnAsync(async () => {
+      await render(Root);
+      await nextTick();
+      const chartStub = suite.getChartStub();
+      expect(getLastGraphicOption(chartStub)).toMatchObject(option.value);
+
+      const toggleGraphicSlot = async (value: boolean) => {
+        chartStub.setOption.mockClear();
+        showGraphic.value = value;
+        await nextTick();
+        expect(chartStub.setOption).toHaveBeenCalledOnce();
+      };
+
+      await toggleGraphicSlot(true);
+      expect(getLastGraphicIds(chartStub)).toEqual([]);
+      expect(getLastSetOptionCall(chartStub)[1]?.replaceMerge).toContain("graphic");
+
+      await toggleGraphicSlot(false);
+      expect(getLastGraphicOption(chartStub)).toMatchObject(option.value);
+      expect(getLastSetOptionCall(chartStub)[1]?.replaceMerge).toContain("graphic");
+
+      chartStub.setOption.mockClear();
+      option.value = { graphic: { elements: [] } };
+      showGraphic.value = true;
+      await nextTick();
+      expect(chartStub.setOption).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("warns once when duplicate graphic ids are rendered", async () => {
+    registerExtension();
+
+    const option = ref({ series: [{ type: "line", data: [1, 2, 3] }] });
+    const tick = ref(0);
+
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            { option: option.value },
+            {
+              graphic: () => [
+                h(GRect, { id: "dup", key: `a-${tick.value}`, x: 0, y: 0, width: 8, height: 8 }),
+                h(GRect, { id: "dup", key: `b-${tick.value}`, x: 10, y: 0, width: 8, height: 8 }),
+              ],
+            },
+          );
+      },
+    });
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await render(Root);
+      await nextTick();
+      await flushAnimationFrame();
+
+      tick.value++;
+      await nextTick();
+      await flushAnimationFrame();
+      tick.value++;
+      await nextTick();
+      await flushAnimationFrame();
+
+      const duplicateWarnings = warnSpy.mock.calls.filter((call: unknown[]) =>
+        String(call[0]).includes("Duplicate graphic id"),
+      );
+      expect(duplicateWarnings.length).toBe(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("handles primitive slot children and wrapped vnode arrays", async () => {
+    registerExtension();
+
+    const option = ref({ series: [{ type: "line", data: [1, 2, 3] }] });
+
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            { option: option.value },
+            {
+              graphic: () => [
+                null,
+                "hint",
+                h("div", null, [h(GRect, { id: "wrapped", x: 2, y: 2, width: 6, height: 6 })]),
+              ],
+            },
+          );
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+    await flushAnimationFrame();
+    expect(getLastGraphicIds(suite.getChartStub())).toEqual(["wrapped"]);
+  });
+
+  it("updates flat bindings and nested reactive shape objects", async () => {
+    registerExtension();
+
+    const option = ref({ series: [{ type: "line", data: [1, 2, 3] }] });
+    const x = ref(10);
+    const label = ref("alpha");
+    const nestedShape = reactive({ x: 10, y: 10, width: 20, height: 12 });
+
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            { option: option.value },
+            {
+              graphic: () => [
+                h(GRect, {
+                  id: "marker",
+                  x: x.value,
+                  y: 10,
+                  width: 20,
+                  height: 12,
+                  fill: "#22c55e",
+                }),
+                h(GRect, {
+                  id: "marker-bg",
+                  x: x.value - 2,
+                  y: 8,
+                  width: 24,
+                  height: 16,
+                  fill: "#bfdbfe",
+                }),
+                h(GRect, { id: "nested", shape: nestedShape }),
+                h("div", [h("span", label.value)]),
+              ],
+            },
+          );
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+    await flushAnimationFrame();
+
+    const chartStub = suite.getChartStub();
+    chartStub.setOption.mockClear();
+    x.value = 36;
+    label.value = "beta";
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(chartStub.setOption).toHaveBeenCalledTimes(1);
+    const graphic = getLastGraphicChanges(chartStub);
+    const marker = graphic.find((item) => item.id === "marker");
+    const markerBg = graphic.find((item) => item.id === "marker-bg");
+    expect(marker?.shape).toMatchObject({ x: 36 });
+    expect(marker?.style).toMatchObject({ fill: "#22c55e" });
+    expect(markerBg?.shape).toMatchObject({ x: 34 });
+    chartStub.setOption.mockClear();
+
+    nestedShape.x = 36;
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(chartStub.setOption).toHaveBeenCalledTimes(1);
+    const nested = getLastGraphicChanges(chartStub).find(
+      (item: { id?: string }) => item.id === "nested",
+    );
+    expect(nested?.shape).toMatchObject({
+      x: 36,
+    });
+  });
+
+  it("coalesces option and slot changes with minimal update options", async () => {
+    registerExtension();
+
+    const option = ref({ series: [{ type: "line", data: [1, 2, 3] }] });
+    const x = ref(10);
+    const showMarker = ref(true);
+
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            { option: option.value, updateOptions: { replaceMerge: "series" } },
+            {
+              tooltip: () => h("span", "tooltip"),
+              ...(showMarker.value ? { "tooltip-extra": () => h("span", "extra") } : {}),
+              graphic: () =>
+                showMarker.value
+                  ? h(GRect, { id: "marker", x: x.value, y: 10, width: 20, height: 12 })
+                  : null,
+            },
+          );
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+    await flushAnimationFrame();
+
+    const chartStub = suite.getChartStub();
+    chartStub.setOption.mockClear();
+
+    option.value = { series: [{ type: "line", data: [3, 2, 1] }] };
+    x.value = 36;
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(chartStub.setOption).toHaveBeenCalledTimes(1);
+    const replacements = chartStub.setOption.mock.calls.map(
+      ([, updateArg]) => updateArg?.replaceMerge,
+    );
+    expect(replacements).toContainEqual("series");
+    const marker = getLastGraphicChanges(chartStub)[0];
+    expect(marker?.shape).toMatchObject({ x: 36 });
+
+    chartStub.setOption.mockClear();
+    option.value = { series: [{ type: "line", data: [2, 1, 3] }] };
+    showMarker.value = false;
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(chartStub.setOption).toHaveBeenCalledTimes(1);
+    expect(getLastGraphicOption(chartStub).graphic.elements[0].children).toEqual([]);
+    expect(getLastSetOptionCall(chartStub)[1]).toEqual({
+      replaceMerge: ["series", "graphic"],
+    });
+  });
+
+  it("preserves update options for graphic-only changes", async () => {
+    registerExtension();
+
+    const x = ref(10);
+    const updateOptions = {
+      lazyUpdate: true,
+      silent: true,
+      replaceMerge: "series",
+    };
+    const Root = defineComponent({
+      setup: () => () =>
+        h(
+          ECharts,
+          {
+            option: { series: [{ type: "line", data: [1, 2, 3] }] },
+            updateOptions,
+          },
+          {
+            graphic: () => h(GRect, { id: "marker", x: x.value, y: 10, width: 20, height: 12 }),
+          },
+        ),
+    });
+
+    await render(Root);
+    await nextTick();
+    await flushAnimationFrame();
+
+    const chartStub = suite.getChartStub();
+    chartStub.setOption.mockClear();
+    x.value = 36;
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(chartStub.setOption).toHaveBeenCalledOnce();
+    expect(getLastSetOptionCall(chartStub)[1]).toEqual({
+      lazyUpdate: true,
+      silent: true,
+      replaceMerge: "series",
+    });
+  });
+
+  it("skips reapplying 100+ unchanged nodes when parent rerenders", async () => {
+    registerExtension();
+
+    const option = ref({ series: [{ type: "line", data: [1, 2, 3] }] });
+    const rerenderTick = ref(0);
+    const items = Array.from({ length: 120 }, (_, i) => i);
+
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            ECharts,
+            { option: option.value, class: `tick-${rerenderTick.value}` },
+            {
+              graphic: () =>
+                items.map((i) =>
+                  h(GRect, {
+                    id: `node-${i}`,
+                    x: i * 2,
+                    y: i % 10,
+                    width: 2,
+                    height: 2,
+                  }),
+                ),
+            },
+          );
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+    await flushAnimationFrame();
+
+    const chartStub = suite.getChartStub();
+    const baseCalls = chartStub.setOption.mock.calls.length;
+    rerenderTick.value += 1;
+    await nextTick();
+    await flushAnimationFrame();
+
+    expect(document.querySelector("x-vue-echarts")?.classList.contains("tick-1")).toBe(true);
+    expect(chartStub.setOption.mock.calls.length).toBe(baseCalls);
+  });
+});

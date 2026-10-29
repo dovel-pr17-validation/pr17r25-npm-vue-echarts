@@ -1,0 +1,3 @@
+pnpm-lock.yaml
+demo/data/*.json
+src/style.css

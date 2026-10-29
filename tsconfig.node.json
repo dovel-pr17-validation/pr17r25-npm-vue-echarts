@@ -1,0 +1,13 @@
+{
+  "include": ["*.config.*", "scripts/**/*"],
+  "compilerOptions": {
+    "composite": true,
+    "lib": ["ESNext"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "types": ["node"]
+  }
+}

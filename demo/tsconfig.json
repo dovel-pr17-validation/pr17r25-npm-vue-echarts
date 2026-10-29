@@ -1,0 +1,9 @@
+{
+  "extends": "@vue/tsconfig/tsconfig.dom.json",
+  "include": ["./**/*.ts", "./**/*.vue"],
+  "compilerOptions": {
+    "types": ["vite/client"],
+    "allowJs": true,
+    "noUncheckedIndexedAccess": false
+  }
+}

@@ -1,0 +1,414 @@
+import { describe, expect, it, vi } from "vitest";
+import { createApp, defineComponent, h, nextTick, provide, ref, shallowRef } from "vue";
+import type { LinearGradientObject, PatternObject } from "echarts";
+
+import { render } from "./helpers/testing";
+import { createFrame, withConsoleWarnAsync } from "./helpers/dom";
+import { GRAPHIC_COLLECTOR_KEY, GRAPHIC_PARENT_ID_KEY } from "../src/graphic/context";
+import { GArc, GGroup, GImage, GPolyline, GRect, GText } from "../src/graphic/components";
+import { GraphicMount } from "../src/graphic/mount";
+
+type CollectorMock = {
+  beginPass: ReturnType<typeof vi.fn>;
+  setRoot: ReturnType<typeof vi.fn>;
+  register: ReturnType<typeof vi.fn>;
+  unregister: ReturnType<typeof vi.fn>;
+  warn: ReturnType<typeof vi.fn>;
+  requestFlush: ReturnType<typeof vi.fn>;
+  dispose: ReturnType<typeof vi.fn>;
+  getNodes: () => Iterable<unknown>;
+};
+
+function createCollectorMock(): CollectorMock {
+  return {
+    beginPass: vi.fn(),
+    setRoot: vi.fn(),
+    register: vi.fn(),
+    unregister: vi.fn(),
+    warn: vi.fn(),
+    requestFlush: vi.fn(),
+    dispose: vi.fn(),
+    getNodes: () => [],
+  };
+}
+
+function withGraphicProvider(collector: CollectorMock, renderChild: () => any) {
+  return defineComponent({
+    setup() {
+      const parentId = shallowRef<string | null>(null);
+      provide(GRAPHIC_COLLECTOR_KEY, collector as any);
+      provide(GRAPHIC_PARENT_ID_KEY, parentId);
+      return () => h("div", renderChild());
+    },
+  });
+}
+
+function getLastRegisterPayload(collector: CollectorMock): any {
+  const lastCall = collector.register.mock.calls.at(-1);
+  if (!lastCall) {
+    throw new Error("Expected collector.register to be called at least once.");
+  }
+  return lastCall[0];
+}
+
+describe("graphic components", () => {
+  it("warns when component is used outside #graphic slot", async () => {
+    const Root = defineComponent({
+      setup() {
+        return () => h(GRect, { id: "x" });
+      },
+    });
+
+    await withConsoleWarnAsync(async (warnSpy) => {
+      await render(Root);
+      const hasWarning = warnSpy.mock.calls.some((call: unknown[]) =>
+        String(call[0]).includes("must be used inside `#graphic` slot"),
+      );
+      expect(hasWarning).toBe(true);
+    });
+
+    await nextTick();
+  });
+
+  it("uses vnode key as id and forwards common props", async () => {
+    const collector = createCollectorMock();
+    const keyframeAnimation = [
+      { duration: 1000, keyframes: [{ percent: 1, x: 20 }] },
+      { duration: 1000, keyframes: [{ percent: 1, rotation: 1 }] },
+    ];
+
+    const Root = withGraphicProvider(collector, () =>
+      h(GRect, {
+        key: "rect-key",
+        name: "main-rect",
+        tooltip: { show: true },
+        shape: { x: 1, y: 2, width: 3, height: 4 },
+        style: { fill: "#0ea5e9" },
+        keyframeAnimation,
+        onClick: () => void 0,
+      }),
+    );
+
+    await withConsoleWarnAsync(async (warnSpy) => {
+      await render(Root);
+      expect(
+        warnSpy.mock.calls.some((call: unknown[]) =>
+          String(call[0]).includes('type check failed for prop "keyframeAnimation"'),
+        ),
+      ).toBe(false);
+    });
+    await nextTick();
+
+    expect(collector.register).toHaveBeenCalled();
+    const payload = getLastRegisterPayload(collector);
+    expect(payload.id).toBe("rect-key");
+    expect(payload.props.name).toBe("main-rect");
+    expect(payload.props.tooltip).toEqual({ show: true });
+    expect(payload.handlers).toMatchObject({ onClick: expect.any(Function) });
+    expect(payload.props.shape).toMatchObject({ x: 1, y: 2, width: 3, height: 4 });
+    expect(payload.props.style).toMatchObject({ fill: "#0ea5e9" });
+    expect(payload.props.keyframeAnimation).toBe(keyframeAnimation);
+  });
+
+  it("evaluates nested group slots once without updating stable children", async () => {
+    const collector = createCollectorMock();
+    const renderTick = ref(0);
+    const groupSlot = vi.fn(() => [h(GRect, { id: "child" }), `tick-${renderTick.value}`]);
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h(
+            GraphicMount,
+            { collector: collector as any },
+            {
+              default: () => h(GGroup, { id: "group" }, { default: groupSlot }),
+            },
+          );
+      },
+    });
+
+    await render(Root);
+    await nextTick();
+
+    expect(groupSlot).toHaveBeenCalledOnce();
+
+    groupSlot.mockClear();
+    collector.register.mockClear();
+    renderTick.value++;
+    await nextTick();
+
+    expect(groupSlot).toHaveBeenCalledOnce();
+    expect(collector.register.mock.calls.map(([node]) => node.id)).toEqual(["group"]);
+  });
+
+  it("accepts media elements from another document", async () => {
+    const collector = createCollectorMock();
+    const { iframe, ownerDocument } = createFrame();
+    const media = [
+      ownerDocument.createElement("img"),
+      ownerDocument.createElement("canvas"),
+      ownerDocument.createElement("video"),
+    ];
+    const crop = { sx: 1, sy: 2, sWidth: 30, sHeight: 40 };
+    const Root = withGraphicProvider(collector, () =>
+      media.map((image, index) => h(GImage, { id: index, image, ...crop })),
+    );
+
+    try {
+      await withConsoleWarnAsync(async (warnSpy) => {
+        await render(Root);
+        expect(
+          warnSpy.mock.calls.some((call: unknown[]) =>
+            String(call[0]).includes('type check failed for prop "image"'),
+          ),
+        ).toBe(false);
+      });
+      await nextTick();
+
+      expect(collector.register.mock.calls.map(([node]) => node.props.image)).toEqual(media);
+      expect(getLastRegisterPayload(collector).props).toMatchObject(crop);
+    } finally {
+      iframe.remove();
+    }
+  });
+
+  it("mounts hidden graphic content in the component owner document", async () => {
+    const collector = createCollectorMock();
+    const { iframe, ownerDocument } = createFrame();
+    const container = ownerDocument.body.appendChild(ownerDocument.createElement("div"));
+    const teleported = shallowRef<HTMLElement>();
+    let mountedDocument: Document | undefined;
+    const Root = defineComponent({
+      setup() {
+        return () =>
+          h("div", [
+            h(
+              GraphicMount,
+              { collector: collector as any },
+              {
+                default: () =>
+                  h("span", {
+                    ref: teleported,
+                    onVnodeMounted: ({ el }) => {
+                      mountedDocument = (el as HTMLElement).ownerDocument;
+                    },
+                  }),
+              },
+            ),
+          ]);
+      },
+    });
+    const app = createApp(Root);
+
+    try {
+      app.mount(container);
+      await nextTick();
+
+      expect(teleported.value?.ownerDocument).toBe(ownerDocument);
+      expect(mountedDocument).toBe(ownerDocument);
+      expect(teleported.value?.isConnected).toBe(false);
+    } finally {
+      app.unmount();
+      iframe.remove();
+    }
+  });
+
+  it("accepts native graphic paint controls", async () => {
+    const collector = createCollectorMock();
+    const fill: LinearGradientObject = {
+      type: "linear",
+      x: 0,
+      y: 0,
+      x2: 1,
+      y2: 0,
+      colorStops: [
+        { offset: 0, color: "#0ea5e9" },
+        { offset: 1, color: "#22c55e" },
+      ],
+    };
+    const stroke: PatternObject = { image: "pattern.png", repeat: "repeat" };
+    const paint = {
+      fill,
+      stroke,
+      decal: stroke,
+      strokePercent: 0,
+      strokeFirst: false,
+      lineDash: false,
+      strokeNoScale: false,
+      fillOpacity: 0.5,
+      strokeOpacity: 0.75,
+    } as const;
+    const Root = withGraphicProvider(collector, () => h(GRect, { id: "paint", ...paint }));
+
+    await withConsoleWarnAsync(async (warnSpy) => {
+      await render(Root);
+      expect(
+        warnSpy.mock.calls.some((call: unknown[]) =>
+          String(call[0]).includes("type check failed for prop"),
+        ),
+      ).toBe(false);
+    });
+    await nextTick();
+
+    const props = getLastRegisterPayload(collector).props;
+    expect(props).toMatchObject(paint);
+  });
+
+  it("accepts native text styles", async () => {
+    const collector = createCollectorMock();
+    const textStyle = {
+      width: "50%",
+      backgroundColor: { image: "texture.png" },
+      padding: [2, 4],
+      margin: 3,
+      borderColor: "#334155",
+      borderWidth: 1,
+      borderRadius: [2, 4],
+      lineDash: [2, 1],
+      borderDash: false as const,
+      borderDashOffset: 2,
+      rich: { accent: { fill: "#0ea5e9" } },
+      tag: "label",
+      placeholder: "…",
+      truncateMinChar: 2,
+    };
+    const Root = withGraphicProvider(collector, () =>
+      h(GText, { id: "text-box", text: "Label", ...textStyle }),
+    );
+
+    await withConsoleWarnAsync(async (warnSpy) => {
+      await render(Root);
+      expect(
+        warnSpy.mock.calls.some((call: unknown[]) =>
+          String(call[0]).includes("type check failed for prop"),
+        ),
+      ).toBe(false);
+    });
+    await nextTick();
+
+    expect(getLastRegisterPayload(collector).props).toMatchObject(textStyle);
+  });
+
+  it("preserves zrender defaults until explicitly overridden", async () => {
+    const collector = createCollectorMock();
+
+    const Root = withGraphicProvider(collector, () => [
+      h(GRect, { id: "defaults" }),
+      h(GRect, {
+        id: "flags",
+        silent: false,
+        draggable: true,
+        ignore: false,
+        invisible: true,
+        clipPath: false,
+      }),
+      h(GPolyline, { id: "smooth-default" }),
+      h(GPolyline, { id: "smooth-zero", smooth: 0 }),
+      h(GArc, { id: "default" }),
+      h(GArc, { id: "counterclockwise", clockwise: false }),
+      h(GArc, { id: "clockwise", clockwise: true }),
+    ]);
+
+    await render(Root);
+    await nextTick();
+
+    const propsById = Object.fromEntries(
+      collector.register.mock.calls.map(([node]) => [node.id, node.props]),
+    );
+    expect(propsById.defaults).toMatchObject({
+      silent: undefined,
+      draggable: undefined,
+      ignore: undefined,
+      invisible: undefined,
+      clipPath: undefined,
+      autoBatch: undefined,
+      lineDash: undefined,
+      strokeNoScale: undefined,
+      strokeFirst: undefined,
+    });
+    expect(propsById.flags).toMatchObject({
+      silent: false,
+      draggable: true,
+      ignore: false,
+      invisible: true,
+      clipPath: false,
+    });
+    expect(propsById["smooth-default"].smooth).toBeUndefined();
+    expect(propsById["smooth-zero"].smooth).toBe(0);
+    expect(propsById.default.clockwise).toBeUndefined();
+    expect(propsById.counterclockwise.clockwise).toBe(false);
+    expect(propsById.clockwise.clockwise).toBe(true);
+  });
+
+  it("keeps a generated fallback id stable", async () => {
+    const collector = createCollectorMock();
+    const x = ref(0);
+
+    const Root = withGraphicProvider(collector, () => h(GRect, { x: x.value }));
+
+    await render(Root);
+    await nextTick();
+    const id = getLastRegisterPayload(collector).id;
+    expect(id).toEqual(expect.any(String));
+
+    x.value++;
+    await nextTick();
+
+    expect(getLastRegisterPayload(collector).id).toBe(id);
+  });
+
+  it("unregisters an empty-string id when it changes", async () => {
+    const collector = createCollectorMock();
+    const id = ref("");
+
+    const Root = withGraphicProvider(collector, () => h(GRect, { id: id.value }));
+
+    await render(Root);
+    await nextTick();
+
+    id.value = "rect-b";
+    await nextTick();
+
+    expect(collector.unregister).toHaveBeenCalledWith("", expect.any(Number));
+  });
+
+  it("provides group parent id to descendants and handles empty default slot", async () => {
+    const collector = createCollectorMock();
+
+    const Root = withGraphicProvider(collector, () => [
+      h(
+        GGroup,
+        { id: "group-root" },
+        {
+          default: () => [h(GRect, { id: "child-rect" })],
+        },
+      ),
+      h(GGroup, { id: "group-empty" }),
+    ]);
+
+    await render(Root);
+    await nextTick();
+
+    const calls = collector.register.mock.calls.map((entry) => entry[0] as any);
+    const child = calls.find((entry) => entry.id === "child-rect");
+    expect(child.parentId).toBe("group-root");
+    expect(calls.some((entry) => entry.id === "group-empty")).toBe(true);
+  });
+
+  it("unregisters node when component is unmounted by v-if", async () => {
+    const collector = createCollectorMock();
+    const visible = ref(true);
+
+    const Root = withGraphicProvider(collector, () =>
+      visible.value ? h(GRect, { id: "toggle-node" }) : null,
+    );
+
+    await render(Root);
+    await nextTick();
+
+    visible.value = false;
+    await nextTick();
+
+    expect(collector.unregister).toHaveBeenCalledWith("toggle-node", expect.any(Number));
+  });
+});

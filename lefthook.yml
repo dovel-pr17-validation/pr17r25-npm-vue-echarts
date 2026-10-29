@@ -1,0 +1,14 @@
+pre-commit:
+  parallel: true
+  commands:
+    typecheck:
+      glob: "*.{ts,mts,cts,vue}"
+      run: pnpm typecheck
+    lint:
+      glob: "*.{ts,js,mjs,cjs,mts,cts,vue}"
+      run: pnpm exec oxlint --fix {staged_files}
+      stage_fixed: true
+    format:
+      glob: "*.{ts,js,mjs,cjs,cts,mts,json,md,yml,yaml,vue}"
+      run: pnpm exec oxfmt {staged_files}
+      stage_fixed: true
